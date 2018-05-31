@@ -393,7 +393,7 @@ class Module(object):
             return self._apply(lambda t: t.to(device))
 
     def register_backward_hook(self, hook):
-        r"""Registers a backward hook on the module.
+        """Registers a backward hook on the module.
 
         The hook will be called every time the gradients with respect to module
         inputs are computed. The hook should have the following signature::
