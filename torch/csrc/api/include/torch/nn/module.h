@@ -1,9 +1,11 @@
 #pragma once
 
-#include "torch/detail.h"
+#include <torch/detail/ordered_dict.h>
+#include <torch/nn/cursor.h>
+#include <torch/nn/pimpl.h>
+#include <torch/tensor.h>
 
-#include <torch/csrc/autograd/variable.h>
-
+#include <ATen/ATen.h>
 #include <ATen/optional.h>
 
 #include <map>
@@ -11,6 +13,13 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+
+namespace torch {
+namespace detail {
+template <typename T>
+class CursorBase;
+} // namespace detail
+} // namespace torch
 
 namespace torch {
 namespace nn {
@@ -30,18 +39,26 @@ class Module {
   /// Returns the name of the `Module`.
   const std::string& name() const noexcept;
 
+  /// Performs a recursive deep copy of the module and all its registered
+  /// parameters, buffers and submodules.
   virtual std::shared_ptr<Module> clone() const;
 
-  // Only construct parameters in initialize_parameters, and
-  // containers in initialize_containers. Most of the time, the containers are
-  // the only thing you need to add.
-  // You are guaranteed that containers are added before parameters.
-  virtual void initialize_containers() {}
-  virtual void initialize_parameters() {}
-  virtual void reset_parameters() {}
+  /// Provides a means to traverse the `Module` tree.
+  ModuleCursor modules();
+  ConstModuleCursor modules() const;
 
-  std::map<std::string, Variable> parameters() const;
-  Variable& param(std::string const&);
+  /// Traverses the (immediate) children of the `Module`.
+  ModuleCursor children();
+  ConstModuleCursor children() const;
+
+  /// Provides a means to recursively access the parameters of the `Module`
+  /// tree.
+  ParameterCursor parameters();
+  ConstParameterCursor parameters() const;
+
+  /// Provides a means to recursively access the buffers of the `Module` tree.
+  BufferCursor buffers();
+  ConstBufferCursor buffers() const;
 
   /// Enables training mode.
   virtual void train();
@@ -52,20 +69,29 @@ class Module {
   /// True if the module is in training mode.
   virtual bool is_training() const noexcept;
 
-  /// Recursively moves all parameters to CPU memory (in place).
-  virtual void cpu();
+  /// Recursively casts all parameters to the given dtype and device.
+  /// If `non_blocking` is true and the source is in pinned memory and
+  /// destination is on the GPU or vice versa, the copy is performed
+  /// asynchronously with respect to the host. Otherwise, the argument has no
+  /// effect.
+  virtual void to(
+      torch::Device device,
+      torch::Dtype dtype,
+      bool non_blocking = false);
 
-  /// Recursively moves all parameters to CUDA memory (in place).
-  virtual void cuda();
+  /// Recursively casts all parameters to the given dtype.
+  /// If `non_blocking` is true and the source is in pinned memory and
+  /// destination is on the GPU or vice versa, the copy is performed
+  /// asynchronously with respect to the host. Otherwise, the argument has no
+  /// effect.
+  virtual void to(torch::Dtype dtype, bool non_blocking = false);
 
-  /// Recursively casts all parameters to the given type.
-  virtual void to(at::Type& type);
-
-  /// Recursively casts all parameters to the given scalar type.
-  virtual void to(at::ScalarType scalar_type);
-
-  /// Recursively moves all parameters to the given backend.
-  virtual void to(at::Backend backend);
+  /// Recursively moves all parameters to the given device.
+  /// If `non_blocking` is true and the source is in pinned memory and
+  /// destination is on the GPU or vice versa, the copy is performed
+  /// asynchronously with respect to the host. Otherwise, the argument has no
+  /// effect.
+  virtual void to(torch::Device device, bool non_blocking = false);
 
   /// Recursively zeros out the `grad` values of all parameters.
   virtual void zero_grad();
@@ -73,46 +99,100 @@ class Module {
   template <class Archive>
   void save(Archive& ar) const {
     auto params = parameters();
-    std::size_t size = params.size();
+    size_t size = params.size();
     ar(size);
     for (auto& p : params) {
-      ar(p.first, p.second);
+      ar(p.key, p.value);
     }
   }
 
   template <class Archive>
   void load(Archive& ar) {
     auto params = parameters();
-    std::size_t size;
+    size_t size;
     ar(size);
     std::string name;
-    for (std::size_t i = 0; i < size; i++) {
+    for (size_t i = 0; i < size; i++) {
       ar(name);
       ar(params[name]);
     }
   }
 
- protected:
-  Variable register_parameter(const std::string& name, at::Tensor tensor);
-  Variable register_buffer(const std::string& name, at::Tensor tensor);
+  /// Returns true if the dynamic type of this module is of the given
+  /// `ModuleType`. Performs a `dynamic_cast` to check this.
+  template <
+      typename ModuleType,
+      typename = torch::detail::disable_if_module_holder_t<ModuleType>>
+  bool is() const noexcept {
+    return dynamic_cast<const ModuleType*>(this) != nullptr;
+  }
 
+  /// Returns true if the dynamic type of this module is of the given
+  /// `ModuleType`. Performs a `dynamic_cast` to check this.
   template <typename ModuleType>
+  torch::enable_if_t<torch::detail::is_module_holder<ModuleType>::value, bool>
+  is() const noexcept {
+    // Use the contained type of the `ModuleHolder`, e.g. `LinearImpl` for
+    // `Linear`, since `LinearImpl` inherits `nn::Module`.
+    return is<typename ModuleType::ContainedType>();
+  }
+
+ protected:
+  Tensor& register_parameter(
+      std::string name,
+      Tensor tensor,
+      bool requires_grad = true);
+  Tensor& register_buffer(std::string name, Tensor tensor);
+
+  template <
+      typename ModuleType,
+      typename = torch::detail::disable_if_module_holder_t<ModuleType>>
   std::shared_ptr<ModuleType> register_module(
-      const std::string& name,
-      const std::shared_ptr<ModuleType>& module) {
-    const auto pair = children_.emplace(name, module);
-    AT_CHECK(pair.second, "Module has already been registered");
-    return module;
+      std::string name,
+      std::shared_ptr<ModuleType> module) {
+    auto& base_module = children_.insert(std::move(name), std::move(module));
+    return std::static_pointer_cast<ModuleType>(base_module);
+  }
+
+  template <typename ModuleHolderType>
+  ModuleHolderType register_module(
+      std::string name,
+      ModuleHolderType module_holder) {
+    register_module(std::move(name), module_holder.get());
+    return module_holder;
   }
 
  private:
+  template <typename T>
+  using OrderedDict = torch::detail::OrderedDict<std::string, T>;
+
   template <typename Derived>
-  friend class CloneableModule;
+  friend class Cloneable;
+  template <typename T>
+  friend class detail::CursorBase;
 
   virtual void clone_(Module& other);
 
-  std::unordered_map<std::string, Variable> parameters_;
-  std::unordered_map<std::string, std::shared_ptr<Module>> children_;
+  /// The implementation of the various `to()`.
+  template <typename... Ts>
+  void to_impl(Ts&&... ts) {
+    // First call `to()` on every child module.
+    for (auto& child : children_) {
+      child.value->to(ts...);
+    }
+    // Then move every parameter to the new dtype/device.
+    for (auto& parameter : parameters_) {
+      at::detail::set_data(*parameter, parameter->data().to(ts...));
+    }
+    // Then move every buffer to the new dtype/device.
+    for (auto& buffer : buffers_) {
+      at::detail::set_data(*buffer, buffer->data().to(ts...));
+    }
+  }
+
+  OrderedDict<Tensor> parameters_;
+  OrderedDict<Tensor> buffers_;
+  OrderedDict<std::shared_ptr<Module>> children_;
 
   /// The module's name (e.g. "LSTM").
   mutable at::optional<std::string> name_;
@@ -120,74 +200,5 @@ class Module {
   /// Whether the module is in training mode.
   bool is_training_{true};
 };
-
-/// The `clone()` method in the base `Module` class does not have knowledge of
-/// the concrete runtime type of its subclasses. Therefore, `clone()` must
-/// either be called from within the subclass, or from a base class that has
-/// knowledge of the concrete type. `CloneableModule` uses the CRTP to gain
-/// knowledge of the subclass' static type and provide an implementation of the
-/// `clone()` method. We do not want to use this pattern in the base class,
-/// because then storing a module would always require templatizing it.
-template <typename Derived>
-class CloneableModule : public Module {
- public:
-  using Module::Module;
-
-  virtual void reset() = 0;
-
-  /// Moves the `Module` into a `shared_ptr` and calls `reset()` on it.
-  std::shared_ptr<Derived> build() {
-    auto module = std::make_shared<Derived>(static_cast<Derived&&>(*this));
-    module->reset();
-    return std::move(module);
-  }
-
-  /// Performs a recursive "deep copy" of the `Module`, such that all parameters
-  /// and submodules in the cloned module are different from those in the
-  /// original module.
-  std::shared_ptr<Module> clone() const override {
-    const auto& self = static_cast<const Derived&>(*this);
-    auto copy = std::make_shared<Derived>(self);
-    copy->parameters_.clear();
-    copy->children_.clear();
-    copy->reset();
-    for (auto& parameter : parameters_) {
-      copy->parameters_.at(parameter.first)
-          .data()
-          .copy_(parameter.second.data());
-    }
-    for (auto& child : children_) {
-      copy->children_.at(child.first)->clone_(*child.second);
-    }
-    return copy;
-  }
-
- private:
-  void clone_(Module& other) final override {
-    // Here we are *pretty* certain that `other's` type is `Derived` (because it
-    // was registered under the same name as `this`), but you never know what
-    // crazy things `reset()` does, so `dynamic_cast` just to be safe.
-    auto clone = std::dynamic_pointer_cast<Derived>(other.clone());
-    AT_CHECK(
-        clone != nullptr,
-        "Attempted to clone submodule, but it is of a "
-        "different type than the submodule it was to be cloned into");
-    static_cast<Derived&>(*this) = std::move(*clone);
-  }
-};
 } // namespace nn
 } // namespace torch
-
-#define TORCH_ATTR(T, name)                         \
-  auto name(const T& new_##name)->decltype(*this) { \
-    this->name##_ = new_##name;                     \
-    return *this;                                   \
-  }                                                 \
-  auto name(T&& new_##name)->decltype(*this) {      \
-    this->name##_ = std::move(new_##name);          \
-    return *this;                                   \
-  }                                                 \
-  const T& name() const noexcept {                  \
-    return this->name##_;                           \
-  }                                                 \
-  T name##_

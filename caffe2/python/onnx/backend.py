@@ -139,7 +139,7 @@ class Caffe2Backend(Backend):
     # If you increase this, make SURE you cross-reference all BC-breaking
     # changes from one version to the next, and any that you did not
     # implement, mark as broken in _broken_operators
-    _known_opset_version = 6
+    _known_opset_version = 7
 
     # This dictionary will record operators which are KNOWN to be
     # broken, so we give a good error message rather than do something
@@ -177,7 +177,8 @@ class Caffe2Backend(Backend):
         'Squeeze':              {'axes': 'dims'},
         'Unsqueeze':            {'axes': 'dims'},
         'Transpose':            {'perm': 'axes'},
-        'Upsample':             {'mode': ''},
+        'Upsample':             {'mode': '',
+                                 'scales': ''},
         'ConvTranspose':        {'output_padding': 'adjs'},
         'Selu':                 {'gamma': 'scale'},
         'If':                   {'then_branch': 'then_net',
@@ -193,6 +194,7 @@ class Caffe2Backend(Backend):
         'RNN': '_create_rnn_variant',
         'Loop': '_create_loop',
         'If': '_create_if',
+        'Upsample': '_create_upsample',
     }
 
     # Dummy name generator
@@ -376,6 +378,17 @@ class Caffe2Backend(Backend):
 
         return outputs
 
+    @classmethod
+    def _create_upsample(cls, init_model, pred_model, n, opset_version):
+        c2_op = cls._common_onnx_node_to_caffe2_op(init_model, pred_model, n, opset_version)
+        if len(n.attrs['scales']) != 4:
+            raise ValueError("The scales argument should have size 4")
+        elif not (np.isclose(n.attrs['scales'][0], 1) and np.isclose(n.attrs['scales'][1], 1)):
+            raise ValueError("The first two elements in the scales argument must be 1")
+        c2_op.arg.extend([caffe2.python.utils.MakeArgument('height_scale', n.attrs['scales'][2])])
+        c2_op.arg.extend([caffe2.python.utils.MakeArgument('width_scale', n.attrs['scales'][3])])
+
+        return c2_op
 
     @classmethod
     def _create_rnn_variant(cls, init_model, pred_model, n, opset_version):
@@ -705,7 +718,8 @@ class Caffe2Backend(Backend):
         initializer of the predict_graph, "img" is not initalized. We don't have a check for this, since
         there is no way we can know which blob is the input of the predict_graph.
         '''
-        super(Caffe2Backend, cls).prepare(model, device, **kwargs)
+        if not kwargs.pop('no_check_UNSAFE', False):
+            super(Caffe2Backend, cls).prepare(model, device, **kwargs)
         opset_version = None
         for imp in model.opset_import:
             if not imp.HasField("domain") or imp.domain == "":
@@ -854,6 +868,7 @@ class Caffe2Backend(Backend):
         c2_op.output.extend(onnx_node.outputs)
         c2_op.name = onnx_node.name
 
+
         onnx_op_type = onnx_node.op_type
         broken_version = cls._broken_operators.get(onnx_op_type, float('Inf'))
         if broken_version <= opset_version:
@@ -981,3 +996,5 @@ run_node = Caffe2Backend.run_node
 run_model = Caffe2Backend.run_model
 
 supports_device = Caffe2Backend.supports_device  # noqa
+
+is_compatible = Caffe2Backend.is_compatible

@@ -396,11 +396,11 @@ def softplus(g, self, beta, threshold):
     return g.op('Softplus', self)
 
 
-def max_pool1d(g, input, kernel_size, stride, padding, dilation, ceil_mode):
+def max_pool1d_with_indices(g, input, kernel_size, stride, padding, dilation, ceil_mode):
     if ceil_mode:
-        return _unimplemented("max_pool1d", "ceil_mode")
+        return _unimplemented("max_pool1d_with_indices", "ceil_mode")
     if set(_single(dilation)) != {1}:
-        return _unimplemented("max_pool1d", "dilation")
+        return _unimplemented("max_pool1d_with_indices", "dilation")
     if stride is None:
         stride = kernel_size
     r = g.op("MaxPool", input,
@@ -410,11 +410,11 @@ def max_pool1d(g, input, kernel_size, stride, padding, dilation, ceil_mode):
     return r, None
 
 
-def max_pool2d(g, input, kernel_size, stride, padding, dilation, ceil_mode):
+def max_pool2d_with_indices(g, input, kernel_size, stride, padding, dilation, ceil_mode):
     if ceil_mode:
-        return _unimplemented("max_pool2d", "ceil_mode")
+        return _unimplemented("max_pool2d_with_indices", "ceil_mode")
     if set(_pair(dilation)) != {1}:
-        return _unimplemented("max_pool2d", "dilation")
+        return _unimplemented("max_pool2d_with_indices", "dilation")
     if not stride:
         stride = kernel_size
     r = g.op("MaxPool", input,
@@ -424,11 +424,11 @@ def max_pool2d(g, input, kernel_size, stride, padding, dilation, ceil_mode):
     return r, None
 
 
-def max_pool3d(g, input, kernel_size, stride, padding, dilation, ceil_mode):
+def max_pool3d_with_indices(g, input, kernel_size, stride, padding, dilation, ceil_mode):
     if ceil_mode:
-        return _unimplemented("max_pool3d", "ceil_mode")
+        return _unimplemented("max_pool3d_with_indices", "ceil_mode")
     if set(_triple(dilation)) != {1}:
-        return _unimplemented("max_pool3d", "dilation")
+        return _unimplemented("max_pool3d_with_indices", "dilation")
     if not stride:
         stride = kernel_size
     r = g.op("MaxPool", input,
@@ -599,13 +599,20 @@ def index_select(g, self, index, dim):
     return g.op("Gather", self, index, axis_i=dim)
 
 
+def index_put(g, *inputs, **kwargs):
+    return g.op("ATen", *inputs, operator_s='index_put', **kwargs)
+
+
 def type_as(g, self, other):
-    if self.type().scalarType() == other.type().scalarType():
-        # no-op
+    if self.isTensor() and other.isTensor() and self.type().scalarType() == other.type().scalarType():
         return self
-    else:
-        other_type_name = self.type().scalarType().lower()
+
+    if other.isTensor():
+        other_type_name = other.type().scalarType()
         return g.op("Cast", self, to_i=cast_pytorch_to_onnx[other_type_name])
+    else:
+        # We don't know the type of other, bail by emitting ATen
+        return g.op("ATen", self, other, operator_s="type_as")
 
 
 # ignore clone operators that are inserted by PyTorch autograd
@@ -687,14 +694,25 @@ def _unique(g, input, sorted, return_inverse):
 # TODO: remove these once we support Type's in the JIT IR and we can once again
 # use the unified toType operator
 cast_pytorch_to_onnx = {
-    'uint8_t': torch.onnx.TensorProtoDataType.UINT8,
-    'int8_t': torch.onnx.TensorProtoDataType.INT8,
-    'double': torch.onnx.TensorProtoDataType.DOUBLE,
-    'float': torch.onnx.TensorProtoDataType.FLOAT,
+    'Byte': torch.onnx.TensorProtoDataType.UINT8,
+    'Char': torch.onnx.TensorProtoDataType.INT8,
+    'Double': torch.onnx.TensorProtoDataType.DOUBLE,
+    'Float': torch.onnx.TensorProtoDataType.FLOAT,
     'Half': torch.onnx.TensorProtoDataType.FLOAT16,
-    'int': torch.onnx.TensorProtoDataType.INT32,
-    'int64_t': torch.onnx.TensorProtoDataType.INT64,
-    'int16_t': torch.onnx.TensorProtoDataType.INT16,
+    'Int': torch.onnx.TensorProtoDataType.INT32,
+    'Long': torch.onnx.TensorProtoDataType.INT64,
+    'Short': torch.onnx.TensorProtoDataType.INT16,
+}
+
+scalar_name_to_pytorch = {
+    'uint8_t': 'Byte',
+    'int8_t': 'Char',
+    'double': 'Double',
+    'float': 'Float',
+    'half': 'Half',
+    'int': 'Int',
+    'int64_t': 'Long',
+    'int16_t': 'Short',
 }
 
 
@@ -984,3 +1002,7 @@ def RNN_variant_symbolic_builder(
             return prev_output, h_outs, c_outs
 
     return symbolic
+
+
+def _dim_arange(g, like, dim):
+    return g.op('ATen', like, dim_i=dim, operator_s='_dim_arange')

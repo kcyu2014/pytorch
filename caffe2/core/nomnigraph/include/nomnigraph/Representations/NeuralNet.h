@@ -44,6 +44,7 @@ class Annotation {
 
   Annotation(AnnotationKind K) : Kind(K) {}
   Annotation() : Kind(AnnotationKind::Generic) {}
+  virtual ~Annotation() {}
 
   AnnotationKind getKind() const {
     return Kind;
@@ -52,16 +53,8 @@ class Annotation {
   Annotation(const Annotation&) = delete;
   Annotation& operator=(Annotation&) = delete;
 
-  void* getSaved() const {
-    return Saved;
-  }
-  void setSaved(void* saved) {
-    Saved = saved;
-  }
-
  private:
   const AnnotationKind Kind;
-  void* Saved = nullptr;
 };
 
 class NeuralNetOperator : public Instruction {
@@ -388,7 +381,6 @@ template <typename NewT, typename OldT>
 NNGraph::NodeRef convertNode(NNGraph& g, NNGraph::NodeRef node) {
   assert(is<OldT>(node) && "Cannot get type from node.");
 
-  auto* nnOp = get<NeuralNetOperator>(node);
   NeuralNetOperator* nnOpPtr =
       dyn_cast<NeuralNetOperator>(node->mutableData()->release());
 

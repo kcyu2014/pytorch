@@ -6,7 +6,20 @@
 #define TH_STORAGE_RESIZABLE  2
 #define TH_STORAGE_FREEMEM    4
 
-typedef struct THCStorage THCStorage;
+#define THCStorage THStorage
+
+// These used to be distinct types; for some measure of backwards compatibility and documentation
+// alias these to the single THCStorage type.
+#define THCudaStorage       THCStorage
+#define THCudaDoubleStorage THCStorage
+#ifdef CUDA_HALF_TENSOR
+#define THCudaHalfStorage   THCStorage
+#endif
+#define THCudaByteStorage   THCStorage
+#define THCudaCharStorage   THCStorage
+#define THCudaShortStorage  THCStorage
+#define THCudaIntStorage    THCStorage
+#define THCudaLongStorage   THCStorage
 
 THC_API real* THCStorage_(data)(THCState *state, const THCStorage*);
 THC_API ptrdiff_t THCStorage_(size)(THCState *state, const THCStorage*);

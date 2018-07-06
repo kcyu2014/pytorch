@@ -239,7 +239,7 @@ def verify(model, args, loss_fn=torch.sum, devices=None):
             out = (out, )
         if loss_fn == torch.sum and len(out) != 1:
             raise ValueError(("Model returns {} outputs, but default loss function "
-                             "(torch.sum) can only handle a single output").format(len(out)))
+                              "(torch.sum) can only handle a single output").format(len(out)))
         out_vars, _ = _flatten(out)
         saved_outs = [v.data.clone() for v in out_vars]
         loss = loss_fn(*out)
@@ -301,11 +301,15 @@ def trace(*args, **kwargs):
             raise TypeError("got unexpected keyword arguments: {}".format(", ".join(kwargs.keys())))
 
         if isinstance(func, torch.nn.Module):
-            module = TopLevelTracedModule(func, **executor_options)
-            module._create_method_from_trace('forward', func, args)
-            return module
+            orig = func
         else:
-            return torch._C.GraphExecutor(func, args, **executor_options)
+            # traced functions become a method on an Empty module
+            orig = Module()
+
+        module = TopLevelTracedModule(orig, **executor_options)
+        module._create_method_from_trace('forward', func, args)
+        return module
+
     return wrapper
 
 
@@ -367,16 +371,32 @@ def _script_graph(fn, _frames_up=0):
     return _jit_script_compile(ast, rcb)
 
 
-def script(fn, _frames_up=0):
+def script(fn, optimize=True, _frames_up=0):
     graph = _script_graph(fn, _frames_up=_frames_up + 1)
-    return torch._C.GraphExecutor(graph, True)
+    mod = ScriptModule()
+    mod._create_method_from_graph('forward', graph)
+    # Forward docstrings
+    mod.__doc__ = fn.__doc__
+    return mod
 
 
-ScriptMethodStub = namedtuple('ScriptMethodStub', ('resolution_callback', 'ast'))
+ScriptMethodStub = namedtuple('ScriptMethodStub', ('resolution_callback', 'ast', 'original_method'))
 
 
 def script_method(fn):
-    return ScriptMethodStub(createResolutionCallback(frames_up=1), get_jit_ast(fn))
+    # NOTE: we need to traverse two frames here because the meta-class frame
+    # for ScriptModule will be present, as opposed to invoking @script on a
+    # a function or invoking define() on a CompilationUnit.
+    # The stack will look like:
+    #
+    # 0. createResolutionCallback()
+    # 1. script_method()
+    # 2. ScriptModule metaclass frame
+    # 3. Surrounding scope
+    #
+    # createResolutionCallback internally adds 1 to get us to the scope of this
+    # function (the calling function). Adding 2 gets us to the proper surrounding scope.
+    return ScriptMethodStub(createResolutionCallback(frames_up=2), get_jit_ast(fn), fn)
 
 
 # These OrderedDictWrapper classes replace the actual OrderedDicts in
@@ -501,7 +521,7 @@ class OrderedBufferDict(OrderedDictWrapper):
 # in addition, tuples and lists of these base types are also considered constants
 # If you edit this list, then you also need to edit the handlers in
 # ConstantValue in jit/script/init.cpp
-_constant_types = (bool, float, int, types.FunctionType)
+_constant_types = (bool, float, int, types.FunctionType, torch.device, torch.layout, torch.dtype)
 
 
 def _get_valid_constant(v):
@@ -533,11 +553,13 @@ class ScriptMeta(type(torch._C.ScriptModule)):
     # a pybind11 type
     def __init__(cls, name, bases, attrs):
         # find all the script methods
+        cls._original_methods = {}
         methods = []
         for k, v in sorted(attrs.items()):
             if isinstance(v, ScriptMethodStub):
                 delattr(cls, k)
                 methods.append(v)
+                cls._original_methods[v.original_method.__name__] = v.original_method
         # after the user's __init__ register all the script methods
         # with the module
         original_init = getattr(cls, '__init__', lambda self: None)
@@ -559,7 +581,7 @@ class ScriptMeta(type(torch._C.ScriptModule)):
         return super(ScriptMeta, cls).__init__(name, bases, attrs)
 
 
-class ScriptModule(with_metaclass(ScriptMeta, Module, torch._C.ScriptModule)):
+class ScriptModule(with_metaclass(ScriptMeta, torch._C.ScriptModule, Module)):
     def __init__(self, optimize=True):
         # must be before Module.init since the field is used in __getattr__
         Module.__init__(self)
@@ -570,7 +592,14 @@ class ScriptModule(with_metaclass(ScriptMeta, Module, torch._C.ScriptModule)):
 
     def __getattr__(self, attr):
         if self._has_method(attr):
-            return self._get_method(attr)
+            if attr in self.__class__._original_methods:
+                original_method = self.__class__._original_methods[attr]
+                script_method = self._get_method(attr)
+                return functools.wraps(original_method)(script_method)
+            else:
+                return self._get_method(attr)
+        if attr == 'graph' and self._has_method('forward'):
+            return self.__getattr__('forward').graph
         return Module.__getattr__(self, attr)
 
     def __setattr__(self, attr, value):
@@ -592,12 +621,15 @@ class ScriptModule(with_metaclass(ScriptMeta, Module, torch._C.ScriptModule)):
     def __dir__(self):
         return sorted(Module.__dir__(self) + self._method_names())
 
-    # Module already has this method defined, so we
-    # need to override it and send it through the ScriptModule lookup
-    def forward(self, *args, **kwargs):
-        return self.__getattr__('forward')(*args, **kwargs)
-
     def define(self, lang):
+        # We use frames_up=1 to get to the proper surrounding scope. The stack
+        # will look like:
+        # 0. createResolutionCallback
+        # 1. define()
+        # 2. surrounding scope.
+        #
+        # createResolutionCallback internally adds 1 to get us to our frame, then
+        # we add 1 to get to the proper surrounding scope.
         rcb = createResolutionCallback(frames_up=1)
         self._define(lang, rcb, True)
 
@@ -613,7 +645,8 @@ _compiled_methods_whitelist = {
     '_apply', 'apply', 'cuda', 'cpu', 'type', 'float', 'double', 'half',
     'state_dict', 'load_state_dict', '_load_from_state_dict', 'parameters',
     'named_parameters', '_all_buffers', 'children', 'named_children', 'modules',
-    'named_modules', 'zero_grad', 'share_memory', '_get_name', 'extra_repr'
+    'named_modules', 'zero_grad', 'share_memory', '_get_name', 'extra_repr',
+    '_slow_forward', '_tracing_name'
 }
 
 
@@ -634,7 +667,7 @@ class TracedModule(ScriptModule):
     __frozen = False
 
     def __init__(self, orig, id_set=None, optimize=True):
-        super(TracedModule, self).__init__(optimize=True)
+        super(TracedModule, self).__init__(optimize=optimize)
         if id_set is None:
             id_set = set()
 
@@ -717,12 +750,17 @@ class _ConstSequential(_ConstModuleList):
     def __init__(self, mods):
         super(_ConstSequential, self).__init__(mods._modules.values())
 
-    @script_method
-    def forward(self, input):
-        for m in self:
-            input = m(input)
-        return input
-
+        # we define the forward method via self.define rather than
+        # making it a direct class member (with a @script) annotation
+        # because, in optimized runtime environments where only .pyc files
+        # are shipped, we cant retrieve the source code.
+        # TODO: find a workaround for this and remove this hack
+        self.define("""
+        def forward(self, input):
+            for m in self:
+                input = m(input)
+            return input
+        """)
 
 if not torch._C._jit_init():
     raise RuntimeError("JIT initialization failed")

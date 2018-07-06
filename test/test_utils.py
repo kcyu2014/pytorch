@@ -17,7 +17,6 @@ from torch.utils.checkpoint import checkpoint, checkpoint_sequential
 from torch.utils.trainer import Trainer
 from torch.utils.trainer.plugins import *
 from torch.utils.trainer.plugins.plugin import Plugin
-from torch.utils.serialization import load_lua
 from torch.autograd._functions.utils import prepare_onnx_paddings
 from torch.autograd._functions.utils import check_onnx_broadcast
 from common import IS_WINDOWS, IS_PPC
@@ -281,7 +280,6 @@ class TestDataLoader(TestCase):
         dataiter = iter(dataloader)
         self.assertEqual(len(list(dataiter)), 2)
 
-    @unittest.skipIf(IS_WINDOWS, "FIXME: Intermittent CUDA out-of-memory error")
     def test_multi_drop(self):
         dataloader = torch.utils.data.DataLoader(self.dataset,
                                                  batch_size=self.batch_size,
@@ -491,9 +489,13 @@ class TestLuaReader(TestCase):
         long_size = 8 if sys.platform == 'win32' else None
         tests = load_lua(path, long_size=long_size)
         for name, test in tests['modules'].items():
+            if name == "HardShrink":
+                continue
             test_name = 'test_' + name.replace('nn.', '')
             setattr(cls, test_name, cls._module_test(name, test))
         for name, test in tests['criterions'].items():
+            if name == "HardShrink":
+                continue
             test_name = 'test_' + name.replace('nn.', '')
             setattr(cls, test_name, cls._criterion_test(name, test))
 
@@ -528,6 +530,7 @@ class TestLuaReader(TestCase):
         return input, target.sub(1)
 
 
+@unittest.skipIf('SKIP_TEST_BOTTLENECK' in os.environ.keys(), 'SKIP_TEST_BOTTLENECK is set')
 class TestBottleneck(TestCase):
     def _run(self, command):
         """Returns (return-code, stdout, stderr)"""
@@ -593,14 +596,14 @@ class TestBottleneck(TestCase):
             'Distance between autograd prof output and end of output not in [6, 100] lines', output))
 
     def _check_cuda(self, output):
-        if torch.cuda.is_available():
+        if HAS_CUDA:
             results = re.search('CUDA mode', output)
             self.assertIsNotNone(results, self._fail_msg('Should tell users CUDA', output))
         else:
             results = re.search('CUDA mode', output)
             self.assertIsNone(results, self._fail_msg('Should not tell users about CUDA', output))
 
-    @unittest.skipIf(torch.cuda.is_available(), 'CPU-only test')
+    @unittest.skipIf(HAS_CUDA, 'CPU-only test')
     def test_bottleneck_cpu_only(self):
         rc, out, err = self._run_bottleneck('bottleneck/test.py')
         self.assertEqual(rc, 0, 'Run failed with\n{}'.format(err))
@@ -611,8 +614,7 @@ class TestBottleneck(TestCase):
         self._check_cprof_summary(out)
         self._check_cuda(out)
 
-    @unittest.skipIf(IS_WINDOWS, "FIXME: Intermittent CUDA out-of-memory error")
-    @unittest.skipIf(not torch.cuda.is_available(), 'No CUDA')
+    @unittest.skipIf(not HAS_CUDA, 'No CUDA')
     def test_bottleneck_cuda(self):
         rc, out, err = self._run_bottleneck('bottleneck/test_cuda.py')
         self.assertEqual(rc, 0, 'Run failed with\n{}'.format(err))
@@ -635,7 +637,7 @@ class TestCollectEnv(TestCase):
 
     def _preprocess_info_for_test(self, info_output):
         # Remove the version hash
-        version_hash_regex = re.compile(r'(a\d+)\+.......')
+        version_hash_regex = re.compile(r'(a\d+)\+\w+')
         result = re.sub(version_hash_regex, r'\1', info_output).strip()
 
         # Substitutions to lower the specificity of the versions listed
@@ -670,21 +672,21 @@ class TestCollectEnv(TestCase):
         info_output = get_pretty_env_info()
         self.assertTrue(info_output.count('\n') >= 17)
 
-    # @unittest.skipIf('BUILD_ENVIRONMENT' not in os.environ.keys(), 'CI-only test')
-    # def test_expect(self):
-    #     info_output = get_pretty_env_info()
+    @unittest.skipIf('BUILD_ENVIRONMENT' not in os.environ.keys(), 'CI-only test')
+    def test_expect(self):
+        info_output = get_pretty_env_info()
 
-    #     ci_build_envs = [
-    #         'pytorch-linux-trusty-py2.7',
-    #         'pytorch-linux-xenial-cuda9-cudnn7-py3',
-    #         'pytorch-macos-10.13-py3',
-    #         'pytorch-win-ws2016-cuda9-cudnn7-py3'
-    #     ]
-    #     build_env = os.environ['BUILD_ENVIRONMENT']
-    #     if build_env not in ci_build_envs:
-    #         return
+        ci_build_envs = [
+            'pytorch-linux-trusty-py2.7',
+            'pytorch-linux-xenial-cuda9-cudnn7-py3',
+            'pytorch-macos-10.13-py3',
+            'pytorch-win-ws2016-cuda9-cudnn7-py3'
+        ]
+        build_env = os.environ['BUILD_ENVIRONMENT']
+        if build_env not in ci_build_envs:
+            return
 
-    #     self.assertExpectedOutput(info_output, build_env)
+        self.assertExpectedOutput(info_output, build_env)
 
 
 class TestONNXUtils(TestCase):
@@ -747,6 +749,7 @@ class TestONNXUtils(TestCase):
         try_check_onnx_broadcast(dims1, dims2, True, False)
 
 
-TestLuaReader.init()
 if __name__ == '__main__':
+    from torch.utils.serialization import load_lua
+    TestLuaReader.init()
     run_tests()
